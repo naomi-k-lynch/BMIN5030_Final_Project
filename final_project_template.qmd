@@ -14,9 +14,13 @@ embed-resources: true
 
 Use this template to complete your project throughout the course. Your Final Project presentation will be based on the contents of this document. Replace the title/name above and text below with your own, but keep the headers. Feel free to change the theme and other display settings, although this is not required.
 
+\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+
 ## Overview {#sec-overview}
 
 This project aims to characterize the variation in anti-adeno-associated virus (AAV) antibody eligibility criteria across AAV gene therapy clinical trials using the Aggregate Analysis of ClinicalTrials.gov (AACT) database. By developing a hybrid Natural Language Processing (NLP) extraction pipeline, evaluating a local, open LLM architecture (utilizing \`Ollama\`/\`ellmer\`) against a \`tidyverse\` regex baseline, this study quantifies how key eligibility parameters (serotype, titer thresholds, and assay specifications) correlate with trial characteristics such as sponsor type, indication, and enrollment year. Project scope and clinical motivation were directly inspired by discussions with Dr. Lindsey George, MD (Pediatric Hematology, Penn/CHOP and PI on the Clinical In Vitro Gene Therapy (CIGT) group's biorepository/registry study), while technical foundations in AAV vector science and biological mechanisms were developed through trainings from Dr. Juliana Small, PhD (Regulatory Affairs and Clinical Development, CIGT at CHOP). All project code, documentation, and version control history are available in the \[BMIN5030 Final Project GitHub Repository\](https://github.com/naomi-k-lynch/BMIN5030_Final_Project).
+
+\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
 
 ## Introduction {#sec-introduction}
 
@@ -26,13 +30,102 @@ Adeno-associated virus (AAV) vectors represent a leading platform for *in vivo* 
 
 This issue is fundamentally interdisciplinary, requiring convergence across pediatric hematology/neurology, regulatory science, biomedical informatics, and computational linguistics. Clinical specialists provide the domain knowledge necessary to define meaningful serological parameters and interpret physiological endpoints, while regulatory specialists offer critical insight into trial protocol standards and compliance frameworks. Concurrently, data science and NLP methodologies enable the scalable parsing of unstructured clinical trial protocols stored within public repositories like AACT. This work is deeply rooted in real-world clinical operations: training from Dr. Juliana Small on the molecular science, mechanisms, and importance of AAV vectors provided the foundational biological framework for understanding these eligibility hurdles. Furthermore, insights from Dr. Lindsey George, serving as PI on the CIGT registry study, directly inspired the project's focus on clinical utility and real-world patient impact. Incorporating guidance from both leaders, this project bridges these domains by pairing rigorous cohort scoping - restricting analyses to interventional AAV trials - with transparent data extraction pipeline validation, evaluating local LLM parsing performance against deterministic regex baselines.
 
+\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+
 ## Methods {#sec-methods}
 
 Describe the data used and general methodological approach used to address the problem described in the @sec-introduction. Subsequently, incorporate full R code necessary to retrieve and clean data, and perform analysis. Be sure to include a description of code so that others (including your future self) can understand what you are doing and why.
 
+### Methodological Approach & Data Source
+
+To characterize how anti-adeno-associated virus (AAV) antibody eligibility criteria vary across gene therapy trials, this project utilizes a static snapshot from the Aggregate Analysis of ClinicalTrials.gov (AACT) database. AACT provides comprehensive, relational data covering all registered clinical studies.
+
+Because AACT flat files are distributed as UTF-8 encoded, pipe-delimited (\`\|\`) text files corresponding to individual database tables, our analytical approach avoids memory bottlenecks by leveraging R (\`tidyverse\`). Rather than loading every table in full, we ingest only the required relational files (\`studies.txt\`, \`eligibilities.txt\`, and \`sponsors.txt\`), specify the pipe delimiter explicitly, and perform targeted filtering to isolate interventional AAV trials.
+
+### Data Retrieval and Environment Setup
+
+We'll begin by setting up our workspace and loading the necessary libraries for data manipulation, string parsing, and visualization.
+
+```{r}
+#| message: false
+#| warning: false
+
+# Loading required libraries
+library(tidyverse)
+library(readr)
+library(stringr)
+
+# Setting path to local AACT flat files directory in my repo :)
+# Update this path to match your local repository/data structure!
+data_dir <- "flat_data_files" 
+```
+
+### Ingesting and Joining Core AACT Tables
+
+To build our study cohort, we load the studies table (containing design characteristics, start years, and sponsors) and the elegibilities table (containing the unstructured inclusion/exclusion criteria text). We join these datasets using the unique study identifier nct_id.
+
+```{r}
+#| eval: false
+
+# Creating all our necessary tables from my working directory and AACT flat data files (.txt)
+studies_path <- file.path(data_dir, "studies.txt")
+studies_df <- read_delim(studies_path, delim = "|", show_col_types = FALSE)
+
+elig_path <- file.path(data_dir, "eligibilities.txt")
+elig_df <- read_delim(elig_path, delim = "|", show_col_types = FALSE)
+
+sponsors_path <- file.path(data_dir, "sponsors.txt")
+sponsors_df <- read_delim(sponsors_path, delim = "|", show_col_types = FALSE) %>%
+  filter(lead_or_collaborator == "lead")
+
+interventions_path <- file.path(data_dir, "interventions.txt")
+interventions_df <- read_delim(interventions_path, delim = "|", show_col_types = FALSE)
+
+# Joining the tables together
+aact_merged <- studies_df %>%
+  inner_join(elig_df, by = "nct_id") %>%
+  left_join(sponsors_df, by = "nct_id", relationship = "many-to-one") %>%
+  left_join(interventions_df, by = "nct_id", relationship = "many-to-many")
+```
+
+### Cohort Scoping and EDA
+
+Following guidance from Dr. Lindsey George to ensure rigorous and focused cohort scoping, we restrict our dataset to interventional studies explicitly evaluating AAV vector gene therapies. We conduct exploratory data analysis (EDA) to verify sample size adequacy (N) across trial phases and enrollment years before text extraction.
+
+```{r}
+#| eval: false
+
+# Filter studies for interventional designs and AAV/gene therapy keywords
+target_studies <- studies_df %>%
+  filter(grepl("interventional", study_type, ignore.case = TRUE)) %>%
+  filter(
+    grepl("aav|adeno-associated|gene therapy|rAAV", brief_title, ignore.case = TRUE) |
+      grepl("aav|adeno-associated|gene therapy|rAAV", official_title, ignore.case = TRUE)
+  )
+
+# Extract matching eligibility criteria text and interventions for target cohort
+target_eligibilities <- elig_df %>%
+  semi_join(target_studies, by = "nct_id")
+
+target_interventions <- interventions_df %>%
+  semi_join(target_studies, by = "nct_id")
+
+# Check sample size distribution across trial phases
+phase_summary <- target_studies %>%
+  count(phase, sort = TRUE)
+
+print(phase_summary)
+```
+
+To be continued!
+
+\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+
 ## Results {#sec-results}
 
 Describe your results and include relevant tables, plots, and code/comments used to obtain them. You may refer to the @sec-methods as needed. End with a brief conclusion of your findings related to the question you set out to address. You can include references if you'd like, but this is not required.
+
+\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
 
 ## Conclusion
 
