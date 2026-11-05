@@ -4,3 +4,5 @@
 .Ruserdata
 BMIN503_Final_Project.Rproj
 flat_data_files/
+data/
+*.zip
