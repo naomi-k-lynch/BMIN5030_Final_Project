@@ -1,6 +1,7 @@
 .Rproj.user
 .Rhistory
 .RData
+.RDataTmp
 .Ruserdata
 BMIN503_Final_Project.Rproj
 flat_data_files/
