@@ -40,7 +40,7 @@ Describe the data used and general methodological approach used to address the p
 
 To characterize how anti-adeno-associated virus (AAV) antibody eligibility criteria vary across gene therapy trials, this project utilizes a static snapshot from the Aggregate Analysis of ClinicalTrials.gov (AACT) database. AACT provides comprehensive, relational data covering all registered clinical studies.
 
-Because AACT flat files are distributed as UTF-8 encoded, pipe-delimited (\`\|\`) text files corresponding to individual database tables, our analytical approach avoids memory bottlenecks by leveraging R (\`tidyverse\`). Rather than loading every table in full, we ingest only the required relational files (\`studies.txt\`, \`eligibilities.txt\`, and \`sponsors.txt\`), specify the pipe delimiter explicitly, and perform targeted filtering to isolate interventional AAV trials.
+Because AACT flat files are distributed as UTF-8 encoded, pipe-delimited (\`\|\`) text files corresponding to individual database tables, our analytical approach avoids memory bottlenecks by leveraging R (\`tidyverse\`). Rather than loading every table in full, we ingest only the required relational files (\`studies.txt\`, \`eligibilities.txt\`, \`brief_summaries.txt\`, etc), specify the pipe delimiter explicitly, and perform targeted filtering to isolate interventional AAV trials.
 
 ### Data Retrieval and Environment Setup
 
@@ -54,38 +54,147 @@ We'll begin by setting up our workspace and loading the necessary libraries for 
 library(tidyverse)
 library(readr)
 library(stringr)
+library(lubridate)
+library(patchwork)
+
 
 # Setting path to local AACT flat files directory in my repo :)
 # Update this path to match your local repository/data structure!
 data_dir <- "flat_data_files" 
 ```
 
-### Ingesting and Joining Core AACT Tables
+### Ingesting, Joining, and Filtering Core AACT Tables
 
-To build our study cohort, we load the studies table (containing design characteristics, start years, and sponsors) and the elegibilities table (containing the unstructured inclusion/exclusion criteria text). We join these datasets using the unique study identifier nct_id.
+To build our study cohort, we first want to load the various tables from AACT: studies (containing design characteristics, start years, and sponsors), elegibilities table (containing the unstructured inclusion/exclusion criteria text), interventions, keywords, summaries, and conditions. We join these datasets using the unique study identifier nct_id.
+
+We also will take the time to filter out NCT ID's that are ANCA-associated vasculitis studies! They are caught in our regex matching because they share the same AAV acronym, but don't apply here.
 
 ```{r}
 #| eval: false
 
-# Creating all our necessary tables from my working directory and AACT flat data files (.txt)
-studies_path <- file.path(data_dir, "studies.txt")
-studies_df <- read_delim(studies_path, delim = "|", show_col_types = FALSE)
+# regex matching AAV, rAAV, scAAV, serotypes (AAV9, AAVrh74), and adeno-associated
+aav_pattern <- "\\b(r|sc)?aav[0-9a-z]*\\b|adeno[- ]associated"
 
-elig_path <- file.path(data_dir, "eligibilities.txt")
-elig_df <- read_delim(elig_path, delim = "|", show_col_types = FALSE)
+# --- STEP 1: Load core tables ---
+studies_df       <- read_delim(file.path(data_dir, "studies.txt"), delim = "|", show_col_types = FALSE)
+elig_df          <- read_delim(file.path(data_dir, "eligibilities.txt"), delim = "|", show_col_types = FALSE)
+interventions_df <- read_delim(file.path(data_dir, "interventions.txt"), delim = "|", show_col_types = FALSE)
+other_names_df   <- read_delim(file.path(data_dir, "intervention_other_names.txt"), delim = "|", show_col_types = FALSE)
+keywords_df      <- read_delim(file.path(data_dir, "keywords.txt"), delim = "|", show_col_types = FALSE)
+summaries_df     <- read_delim(file.path(data_dir, "brief_summaries.txt"), delim = "|", show_col_types = FALSE)
+conditions_df    <- read_delim(file.path(data_dir, "conditions.txt"), delim = "|", show_col_types = FALSE)
+sponsors_df <- read_delim(file.path(data_dir, "sponsors.txt"), delim = "|", show_col_types = FALSE)
 
-sponsors_path <- file.path(data_dir, "sponsors.txt")
-sponsors_df <- read_delim(sponsors_path, delim = "|", show_col_types = FALSE) %>%
-  filter(lead_or_collaborator == "lead")
+# --- STEP 2: Union all matching NCT IDs across tables ---
+ncts_studies <- studies_df %>%
+  filter(
+    grepl(aav_pattern, brief_title, ignore.case = TRUE, perl = TRUE) |
+      grepl(aav_pattern, official_title, ignore.case = TRUE, perl = TRUE)
+  ) %>%
+  pull(nct_id)
 
-interventions_path <- file.path(data_dir, "interventions.txt")
-interventions_df <- read_delim(interventions_path, delim = "|", show_col_types = FALSE)
+ncts_interventions <- interventions_df %>%
+  filter(
+    grepl(aav_pattern, name, ignore.case = TRUE, perl = TRUE) |
+      grepl(aav_pattern, description, ignore.case = TRUE, perl = TRUE)
+  ) %>%
+  pull(nct_id)
 
-# Joining the tables together
-aact_merged <- studies_df %>%
-  inner_join(elig_df, by = "nct_id") %>%
-  left_join(sponsors_df, by = "nct_id", relationship = "many-to-one") %>%
-  left_join(interventions_df, by = "nct_id", relationship = "many-to-many")
+ncts_other_names <- other_names_df %>%
+  filter(grepl(aav_pattern, name, ignore.case = TRUE, perl = TRUE)) %>%
+  pull(nct_id)
+
+ncts_keywords <- keywords_df %>%
+  filter(grepl(aav_pattern, downcase_name, ignore.case = TRUE, perl = TRUE)) %>%
+  pull(nct_id)
+
+ncts_summaries <- summaries_df %>%
+  filter(grepl(aav_pattern, description, ignore.case = TRUE, perl = TRUE)) %>%
+  pull(nct_id)
+
+# --- STEP 3: Identifying ANCA-associated vasculitis to remove false positives (getting caught in AAV) ---
+vasculitis_ncts <- unique(c(
+  studies_df %>%
+    filter(
+      grepl("anca[- ]associated|vasculitis", brief_title, ignore.case = TRUE) |
+        grepl("anca[- ]associated|vasculitis", official_title, ignore.case = TRUE)
+    ) %>%
+    pull(nct_id),
+  conditions_df %>%
+    filter(grepl("anca[- ]associated|vasculitis", name, ignore.case = TRUE)) %>%
+    pull(nct_id),
+  keywords_df %>%
+    filter(grepl("anca[- ]associated|vasculitis", downcase_name, ignore.case = TRUE)) %>%
+    pull(nct_id)
+))
+
+# checking counts for all our IDs and filtered false positives!
+clean_aav_ncts <- setdiff(all_aav_ncts, vasculitis_ncts)
+cat("Excluded ANCA-vasculitis false positives:", length(intersect(all_aav_ncts, vasculitis_ncts)), "\n")
+cat("Clean candidate AAV NCT IDs:", length(clean_aav_ncts), "\n")
+
+```
+
+As seen above, we now have 592 candidate NCT IDs, and we'fe filtered out 67 ANCA-vasculitis false positives. Now, let's make our master dataset that will contain all the AACT trials. First, we'll flatten all multi-row tables (interventions and conditions) to 1 row per NCT ID, and then we'll join everything!
+
+```{r}
+# --- STEP 4: Collapse multi-row tables to 1 row per NCT ID ---
+interventions_collapsed <- interventions_df %>%
+  filter(nct_id %in% all_aav_ncts) %>%
+  group_by(nct_id) %>%
+  summarise(
+    intervention_names = paste(unique(na.omit(name)), collapse = "; "),
+    intervention_descriptions = paste(unique(na.omit(description)), collapse = " | "),
+    .groups = "drop"
+  )
+
+conditions_collapsed <- conditions_df %>%
+  filter(nct_id %in% all_aav_ncts) %>%
+  group_by(nct_id) %>%
+  summarise(
+    conditions = paste(unique(na.omit(name)), collapse = "; "),
+    .groups = "drop"
+  )
+
+sponsors_collapsed <- sponsors_df %>%
+  filter(nct_id %in% clean_aav_ncts) %>%
+  arrange(nct_id, desc(lead_or_collaborator == "lead")) %>%
+  group_by(nct_id) %>%
+  summarise(
+    lead_sponsor = paste(unique(na.omit(name[lead_or_collaborator == "lead"])), collapse = "; "),
+    lead_agency_class = paste(unique(na.omit(agency_class[lead_or_collaborator == "lead"])), collapse = "; "),
+    all_sponsors = paste(unique(na.omit(name)), collapse = "; "),
+    sponsor_agency_classes = paste(unique(na.omit(agency_class)), collapse = "; "),
+    .groups = "drop"
+  )
+
+# --- STEP 5: Build clean 1-row-per-trial master dataset ---
+aav_master_df <- studies_df %>%
+  filter(
+    nct_id %in% clean_aav_ncts,
+    grepl("interventional", study_type, ignore.case = TRUE)
+  ) %>%
+  select(
+    nct_id, brief_title, official_title, phase, overall_status,
+    enrollment, start_date, primary_completion_date, source, source_class
+  ) %>%
+  left_join(
+    elig_df %>% select(nct_id, criteria, minimum_age, maximum_age, child, adult, older_adult),
+    by = "nct_id"
+  ) %>%
+  left_join(interventions_collapsed, by = "nct_id") %>%
+  left_join(conditions_collapsed, by = "nct_id") %>%
+  left_join(sponsors_collapsed, by = "nct_id")
+
+cat("Total unique interventional AAV trials captured:", nrow(aav_master_df), "\n")
+```
+
+```{r}
+aav_master_df %>%
+  filter(!(nct_id %in% ncts_studies)) %>%
+  select(nct_id, brief_title, intervention_names, conditions) %>%
+  slice_head(n = 15) %>%
+  print(n = 15, width = Inf)
 ```
 
 ### Cohort Scoping and EDA
@@ -93,31 +202,457 @@ aact_merged <- studies_df %>%
 Following guidance from Dr. Lindsey George to ensure rigorous and focused cohort scoping, we restrict our dataset to interventional studies explicitly evaluating AAV vector gene therapies. We conduct exploratory data analysis (EDA) to verify sample size adequacy (N) across trial phases and enrollment years before text extraction.
 
 ```{r}
-#| eval: false
-
-# Filter studies for interventional designs and AAV/gene therapy keywords
-target_studies <- studies_df %>%
-  filter(grepl("interventional", study_type, ignore.case = TRUE)) %>%
-  filter(
-    grepl("aav|adeno-associated|gene therapy|rAAV", brief_title, ignore.case = TRUE) |
-      grepl("aav|adeno-associated|gene therapy|rAAV", official_title, ignore.case = TRUE)
+# 1. Overall cohort size and enrollment (N) summary across aav_master_df
+cohort_overview <- aav_master_df %>%
+  summarise(
+    total_trials = n(),
+    total_participants_n = sum(enrollment, na.rm = TRUE),
+    median_enrollment = median(enrollment, na.rm = TRUE),
+    iqr_enrollment = IQR(enrollment, na.rm = TRUE),
+    min_enrollment = min(enrollment, na.rm = TRUE),
+    max_enrollment = max(enrollment, na.rm = TRUE),
+    missing_enrollment = sum(is.na(enrollment))
   )
 
-# Extract matching eligibility criteria text and interventions for target cohort
-target_eligibilities <- elig_df %>%
-  semi_join(target_studies, by = "nct_id")
+print(cohort_overview)
 
-target_interventions <- interventions_df %>%
-  semi_join(target_studies, by = "nct_id")
-
-# Check sample size distribution across trial phases
-phase_summary <- target_studies %>%
-  count(phase, sort = TRUE)
+# 2. Trial count and participant enrollment (N) across trial phases
+phase_summary <- aav_master_df %>%
+  mutate(phase = if_else(is.na(phase) | phase == "", "Not Specified / NA", phase)) %>%
+  group_by(phase) %>%
+  summarise(
+    n_trials = n(),
+    pct_trials = round(n() / nrow(aav_master_df) * 100, 1),
+    total_participants = sum(enrollment, na.rm = TRUE),
+    median_participants = median(enrollment, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_trials))
 
 print(phase_summary)
+
+# 3. Trial counts and enrollment by start/enrollment year
+year_summary <- aav_master_df %>%
+  mutate(start_year = year(as.Date(start_date))) %>%
+  filter(!is.na(start_year)) %>%
+  group_by(start_year) %>%
+  summarise(
+    n_trials = n(),
+    total_participants = sum(enrollment, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(start_year)
+
+print(year_summary, n = Inf)
+
+# 4. Lead sponsor agency class breakdown
+sponsor_summary <- aav_master_df %>%
+  mutate(
+    lead_agency_class = if_else(
+      is.na(lead_agency_class) | lead_agency_class == "",
+      "Not Specified / NA",
+      lead_agency_class
+    )
+  ) %>%
+  group_by(lead_agency_class) %>%
+  summarise(
+    n_trials = n(),
+    pct_trials = round(n() / nrow(aav_master_df) * 100, 1),
+    total_participants = sum(enrollment, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_trials))
+
+print(sponsor_summary)
 ```
 
-To be continued!
+Now that we've got the numbers, let's do some visualization! Here, I am going to create a chart that shows trial counts by phase on the left, and trial starts over time (by enrollment/start year) on the right.
+
+```{r}
+# Prepare phase ordering and clean labels
+phase_plot_df <- aav_master_df %>%
+  mutate(
+    phase_clean = if_else(is.na(phase) | phase == "", "Not Specified / NA", phase)
+  ) %>%
+  count(phase_clean, name = "n_trials") %>%
+  mutate(phase_clean = fct_reorder(phase_clean, n_trials))
+
+# Panel A: Trial count by clinical phase
+p_phase <- ggplot(phase_plot_df, aes(x = phase_clean, y = n_trials)) +
+  geom_col(fill = "#2B5C8F", width = 0.7) +
+  geom_text(aes(label = n_trials), hjust = -0.2, size = 3.5, color = "#1F2933") +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "A. Interventional AAV Trials by Phase",
+    x = NULL,
+    y = "Number of Trials"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold", size = 12)
+  )
+
+# Prepare annual trial counts by start year
+year_plot_df <- aav_master_df %>%
+  mutate(start_year = year(as.Date(start_date))) %>%
+  filter(!is.na(start_year)) %>%
+  count(start_year, name = "n_trials")
+
+# Panel B: Trial starts over time
+p_year <- ggplot(year_plot_df, aes(x = start_year, y = n_trials)) +
+  geom_line(color = "#2B5C8F", linewidth = 0.9) +
+  geom_point(color = "#2B5C8F", size = 2) +
+  labs(
+    title = "B. Trial Starts by Enrollment Year",
+    x = "Start Year",
+    y = "Number of Trials"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 12)
+  )
+
+# Combine side by side
+p_phase + p_year +
+  plot_annotation(
+    caption = "Source: AACT interventional AAV gene therapy cohort (aav_master_df)"
+  )
+```
+
+### Regex-Based NLP Pipeline
+
+To build our regex-based pipeline as a baseline before we benchmark an LLM pipeline, we start on section segmentation of critera text (inclusion vs exclusion). Below, we split the unstructured criteria text from our master dataframe to create separate fields so polarity (e.g. requiring seronegativity vs excluding seropositivity) can be evaluated properly.
+
+```{r}
+# Split unstructured criteria text into Inclusion and Exclusion blocks
+aav_nlp_prep <- aav_master_df %>%
+  mutate(
+    # Normalize line breaks and whitespace artifacts
+    criteria_clean = str_replace_all(criteria, "\\r\\n|\\r", "\n"),
+    
+    # Extract Inclusion block (everything before Exclusion Criteria header)
+    inclusion_text = case_when(
+      str_detect(criteria_clean, regex("exclusion criteria\\s*:?", ignore_case = TRUE)) ~
+        str_extract(criteria_clean, regex("(?s).*?(?=exclusion criteria\\s*:?)", ignore_case = TRUE)),
+      TRUE ~ criteria_clean
+    ),
+    
+    # Extract Exclusion block (everything from Exclusion Criteria header onward)
+    exclusion_text = if_else(
+      str_detect(criteria_clean, regex("exclusion criteria\\s*:?", ignore_case = TRUE)),
+      str_extract(criteria_clean, regex("(?s)exclusion criteria\\s*:?.*", ignore_case = TRUE)),
+      NA_character_
+    )
+  )
+```
+
+Starting from aav_nlp_prep, we'll split on newlines, \~ delimiters, numbered items, and bullet markers to keep individual rules granular while filtering down to lines referencing antibodies, serostatus, or titers.
+
+```{r}
+# Broad recall dictionary for anti-AAV humoral immunity mentions
+ab_mention_regex <- regex(
+  paste0(
+    "\\b(",
+    "antibod(y|ies)|nab|nabs|tab|tabs|igg|igm|",
+    "seropositiv(e|ity)|seronegativ(e|ity)|serostatus|serolog(y|ic|ical)|",
+    "titer(s)?|titre(s)?|neutraliz(ing|ation)|neutralis(ing|ation)|",
+    "binding antibod(y|ies)|pre[- ]?existing immunit(y|ies)|elisa|luminex",
+    ")\\b"
+  ),
+  ignore_case = TRUE
+)
+
+# Expand to 1 row per criterion clause and isolate antibody-relevant lines
+antibody_clauses_v2 <- aav_nlp_prep %>%
+  select(nct_id, phase, lead_agency_class, start_date, enrollment, inclusion_text, exclusion_text) %>%
+  pivot_longer(
+    cols = c(inclusion_text, exclusion_text),
+    names_to = "section",
+    values_to = "section_text"
+  ) %>%
+  mutate(section = str_remove(section, "_text")) %>%
+  filter(!is.na(section_text)) %>%
+  separate_rows(
+    section_text,
+    sep = "\\n+|~+|\\s+(?=[0-9]{1,2}\\.\\s)|\\s*[•\\*\\-]\\s+(?=[A-Z0-9])"
+  ) %>%
+  mutate(clause = str_squish(section_text)) %>%
+  filter(nchar(clause) > 5) %>%
+  filter(str_detect(clause, ab_mention_regex))
+```
+
+Broad antibody matching will pull in non-AAV clinical criteria, so the below code will drop clauses matching known non-AAV serology or inhibitor terms unless the clause also explicitly anchors to an AAV vector, capsid, or transgene.
+
+```{r}
+non_aav_ab_regex <- regex(
+  "\\b(hiv|hepatitis\\s*[a-e]|hbv|hcv|hav|cmv|ebv|hsv|sars-cov-2|covid|factor\\s*(viii|ix|8|9)|fix|fviii|inhibitor|anti-drug)\\b",
+  ignore_case = TRUE
+)
+
+vector_anchor_regex <- regex(
+  "\\b((r|sc)?aav[- ]?(rh)?[0-9a-z]*|adeno[- ]associated|vector|capsid|transgene)\\b",
+  ignore_case = TRUE
+)
+
+antibody_clauses_filtered <- antibody_clauses_v2 %>%
+  mutate(
+    has_vector_anchor = str_detect(clause, vector_anchor_regex),
+    is_non_aav_noise  = str_detect(clause, non_aav_ab_regex)
+  ) %>%
+  filter(has_vector_anchor | !is_non_aav_noise)
+
+```
+
+Now that we have isolated to individual antibody-related clauses, deterministic regular expressions can extract our 4 core clinical eligibility parameters:
+
+- **Target Serotype -** e.g. AAV9, AAVrh74, AAV5, AAV8, AAV2
+
+- **Titer/Cutoff Threshold -** e.g. 1:5, 1:50, \< 1:10, \>= 1:100, or OD/units
+
+- **Assay Methodology** - NAb neutralizing assay vs TAb total binding
+
+- **Eligibility Rule Direction** - does the clause enforce a seronegative requirement or an exclusion cutoff?
+
+```{r}
+regex_baseline_clauses <- antibody_clauses_filtered %>%
+  mutate(
+    extracted_serotype = str_extract_all(
+      clause,
+      regex("\\b(r|sc)?aav[- ]?(rh)?[0-9]{1,2}[a-z0-9]*\\b", ignore_case = TRUE)
+    ) %>% map_chr(~ paste(unique(toupper(.x)), collapse = "; ")),
+    extracted_serotype = na_if(extracted_serotype, ""),
+    
+    extracted_titer = str_extract_all(
+      clause,
+      regex(
+        "([<>≤≥]=?\\s*)?1\\s*:\\s*[0-9,]+|[<>≤≥]=?\\s*[0-9]+(\\.[0-9]+)?\\s*(u/ml|iu/ml|ng/ml|od)",
+        ignore_case = TRUE
+      )
+    ) %>% map_chr(~ paste(unique(.x), collapse = "; ")),
+    extracted_titer = na_if(extracted_titer, ""),
+    
+    extracted_assay = case_when(
+      str_detect(clause, regex("neutraliz|neutralis|\\bnab(s)?\\b", ignore_case = TRUE)) &
+        str_detect(clause, regex("binding|\\btab(s)?\\b|elisa|eclia|meso scale", ignore_case = TRUE)) ~ "Both (NAb & TAb)",
+      str_detect(clause, regex("neutraliz|neutralis|\\bnab(s)?\\b", ignore_case = TRUE)) ~ "Neutralizing Antibody (NAb)",
+      str_detect(clause, regex("binding|\\btab(s)?\\b|elisa|eclia|meso scale|igg", ignore_case = TRUE)) ~ "Total Binding Antibody (TAb)",
+      TRUE ~ "Unspecified Serology"
+    ),
+    
+    has_numeric_cutoff = !is.na(extracted_titer)
+  )
+
+# Clause-level summary counts
+regex_baseline_clauses %>%
+  summarise(
+    total_clauses = n(),
+    unique_trials = n_distinct(nct_id),
+    clauses_with_serotype = sum(!is.na(extracted_serotype)),
+    clauses_with_titer = sum(!is.na(extracted_titer))
+  )
+
+# Breakdown by assay type across filtered clauses
+regex_baseline_clauses %>%
+  count(extracted_assay, sort = TRUE)
+```
+
+Now, because a single trial may contain multiple antibody clauses across inclusion and exclusion criteria, we will roll the extracted clauses back up to the nct_id level and merge them onto aav_master_df so each trial in our cohort is labeled as having or lacking anti-AAV antibody restrictions.
+
+```{r}
+trial_ab_summary <- regex_baseline_clauses %>%
+  group_by(nct_id) %>%
+  summarise(
+    has_ab_criteria = TRUE,
+    ab_sections = paste(unique(section), collapse = "; "),
+    serotypes_mentioned = paste(unique(na.omit(extracted_serotype)), collapse = "; "),
+    titer_cutoffs = paste(unique(na.omit(extracted_titer)), collapse = "; "),
+    assay_types = paste(unique(extracted_assay), collapse = "; "),
+    has_numeric_cutoff = any(has_numeric_cutoff),
+    matched_clauses = paste(clause, collapse = " || "),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    serotypes_mentioned = na_if(serotypes_mentioned, ""),
+    titer_cutoffs = na_if(titer_cutoffs, "")
+  )
+
+aav_baseline_results <- aav_master_df %>%
+  left_join(trial_ab_summary, by = "nct_id") %>%
+  mutate(has_ab_criteria = replace_na(has_ab_criteria, FALSE))
+
+# Trial-level baseline counts
+aav_baseline_results %>%
+  summarise(
+    total_trials = n(),
+    trials_with_ab_criteria = sum(has_ab_criteria),
+    pct_with_ab_criteria = round(mean(has_ab_criteria) * 100, 1),
+    trials_with_numeric_titer = sum(has_numeric_cutoff, na.rm = TRUE)
+  )
+```
+
+### Regex Analysis: Correlates of Antibody Critera & Titer Cutoffs
+
+The below code builds on our trial-level baseline results and clauses to summarize patterns across:
+
+- **Lead sponsor class** - Industry vs NIH, Other, etc
+
+- **Broad indication/therapeutic area** - Grouped via keyword buckets from conditions table
+
+- **Enrollment/start year** - Both annual trends and pre-/post-2020 or era comparisons
+
+- **Trial phase** - Phase 1, Phase 2, Phase 1/2, Phase 3...
+
+```{r}
+# --- STEP 1: Add derived trial covariates (start year, era, broad indication) ---
+aav_analysis_df <- aav_baseline_results %>%
+  mutate(
+    start_year = year(as.Date(start_date)),
+    trial_era = case_when(
+      is.na(start_year) ~ "Unknown",
+      start_year < 2018 ~ "Pre-2018",
+      start_year <= 2021 ~ "2018–2021",
+      TRUE ~ "2022–Present"
+    ),
+    phase_clean = if_else(is.na(phase) | phase == "", "Unspecified / NA", phase),
+    sponsor_clean = if_else(
+      is.na(lead_agency_class) | lead_agency_class == "",
+      "Unspecified / NA",
+      lead_agency_class
+    ),
+    # Broad clinical indication grouping from collapsed conditions string
+    indication_group = case_when(
+      str_detect(conditions, regex("muscular dystrophy|duchenne|becker|myopathy|charcot-marie|pompe|als|amyotrophic", ignore_case = TRUE)) ~ "Neuromuscular / Motor",
+      str_detect(conditions, regex("hemophilia|factor viii|factor ix|von willebrand|bleeding", ignore_case = TRUE)) ~ "Hematology / Coagulation",
+      str_detect(conditions, regex("retinal|retinitis|macular|leber|glaucoma|choroideremia|optic|ocular|eye", ignore_case = TRUE)) ~ "Ophthalmology",
+      str_detect(conditions, regex("parkinson|alzheimer|huntington|epilepsy|dravet|rett|angelman|batten|cns|neuro", ignore_case = TRUE)) ~ "CNS / Neurodegenerative",
+      str_detect(conditions, regex("fabry|gaucher|mucopolysaccharidosis|mps|phenylketonuria|pku|glycogen|metabolic|liver|hepatic|hypercholesterolemia", ignore_case = TRUE)) ~ "Metabolic / Hepatic",
+      str_detect(conditions, regex("heart failure|cardiomyopathy|arrhythmia|cardiac|tachycardia", ignore_case = TRUE)) ~ "Cardiovascular",
+      TRUE ~ "Other / Multi-System"
+    )
+  )
+
+# --- STEP 2: Antibody & numeric-titer prevalence by Lead Sponsor Class ---
+sponsor_ab_summary <- aav_analysis_df %>%
+  group_by(sponsor_clean) %>%
+  summarise(
+    n_trials = n(),
+    n_with_ab = sum(has_ab_criteria),
+    pct_with_ab = round(mean(has_ab_criteria) * 100, 1),
+    n_with_titer = sum(has_numeric_cutoff, na.rm = TRUE),
+    pct_with_titer_among_ab = round(
+      if_else(n_with_ab > 0, n_with_titer / n_with_ab * 100, NA_real_), 1
+    ),
+    median_enrollment = median(enrollment, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_trials))
+
+print(sponsor_ab_summary)
+
+# --- STEP 3: Antibody prevalence by Therapeutic Indication ---
+indication_ab_summary <- aav_analysis_df %>%
+  group_by(indication_group) %>%
+  summarise(
+    n_trials = n(),
+    n_with_ab = sum(has_ab_criteria),
+    pct_with_ab = round(mean(has_ab_criteria) * 100, 1),
+    n_with_titer = sum(has_numeric_cutoff, na.rm = TRUE),
+    pct_with_titer_among_ab = round(
+      if_else(n_with_ab > 0, n_with_titer / n_with_ab * 100, NA_real_), 1
+    ),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_trials))
+
+print(indication_ab_summary)
+
+# --- STEP 4: Antibody prevalence by Start Year & Trial Era ---
+year_ab_summary <- aav_analysis_df %>%
+  filter(!is.na(start_year)) %>%
+  group_by(start_year) %>%
+  summarise(
+    n_trials = n(),
+    n_with_ab = sum(has_ab_criteria),
+    pct_with_ab = round(mean(has_ab_criteria) * 100, 1),
+    n_with_titer = sum(has_numeric_cutoff, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(start_year)
+
+print(year_ab_summary, n = Inf)
+
+era_ab_summary <- aav_analysis_df %>%
+  group_by(trial_era) %>%
+  summarise(
+    n_trials = n(),
+    n_with_ab = sum(has_ab_criteria),
+    pct_with_ab = round(mean(has_ab_criteria) * 100, 1),
+    n_with_titer = sum(has_numeric_cutoff, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(era_ab_summary)
+
+# --- STEP 5: Antibody prevalence by Trial Phase ---
+phase_ab_summary <- aav_analysis_df %>%
+  group_by(phase_clean) %>%
+  summarise(
+    n_trials = n(),
+    n_with_ab = sum(has_ab_criteria),
+    pct_with_ab = round(mean(has_ab_criteria) * 100, 1),
+    n_with_titer = sum(has_numeric_cutoff, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_trials))
+
+print(phase_ab_summary)
+
+# --- STEP 6: Simple statistical association checks (Chi-square / Fisher's exact) ---
+# Sponsor vs. presence of antibody criteria
+sponsor_tab <- aav_analysis_df %>%
+  filter(sponsor_clean %in% c("INDUSTRY", "OTHER", "NIH")) %>%
+  with(table(sponsor_clean, has_ab_criteria))
+
+print(chisq.test(sponsor_tab))
+
+# Indication vs. presence of antibody criteria (Fisher's exact handles smaller cell counts)
+indication_tab <- with(aav_analysis_df, table(indication_group, has_ab_criteria))
+print(fisher.test(indication_tab, simulate.p.value = TRUE))
+```
+
+Now, let's visualize how antibody criteria prevalence varies by sponser type and indication.
+
+```{r}
+p_sponsor <- sponsor_ab_summary %>%
+  filter(n_trials >= 5) %>%
+  mutate(sponsor_clean = fct_reorder(sponsor_clean, pct_with_ab)) %>%
+  ggplot(aes(x = sponsor_clean, y = pct_with_ab)) +
+  geom_col(fill = "#2B5C8F", width = 0.65) +
+  geom_text(aes(label = paste0(pct_with_ab, "% (n=", n_with_ab, "/", n_trials, ")")),
+            hjust = -0.05, size = 3.2) +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, 105), expand = expansion(mult = c(0, 0.05))) +
+  labs(title = "By Lead Sponsor Type", x = NULL, y = "% Trials with Regex Antibody Clause") +
+  theme_minimal(base_size = 11)
+
+p_indication <- indication_ab_summary %>%
+  filter(n_trials >= 5) %>%
+  mutate(indication_group = fct_reorder(indication_group, pct_with_ab)) %>%
+  ggplot(aes(x = indication_group, y = pct_with_ab)) +
+  geom_col(fill = "#3B7A57", width = 0.65) +
+  geom_text(aes(label = paste0(pct_with_ab, "% (n=", n_with_ab, "/", n_trials, ")")),
+            hjust = -0.05, size = 3.2) +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, 105), expand = expansion(mult = c(0, 0.05))) +
+  labs(title = "By Broad Indication", x = NULL, y = "% Trials with Regex Antibody Clause") +
+  theme_minimal(base_size = 11)
+
+p_sponsor / p_indication
+```
 
 \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
 
@@ -125,8 +660,57 @@ To be continued!
 
 Describe your results and include relevant tables, plots, and code/comments used to obtain them. You may refer to the @sec-methods as needed. End with a brief conclusion of your findings related to the question you set out to address. You can include references if you'd like, but this is not required.
 
+### Regex Pipeline
+
+Following cohort scoping and exclusion of false-positive records such as **ANCA-associated vasculitis** acronym collisions (as detailed in @sec-methods), the final analytical cohort comprised of 530 interventional adeno-associated virus (AAV) gene therapy trials. Across these 530 trials, our deterministic tidyverse regular expression pipeline - combining section splitting, granular clause parsing, domain noise filtering, and parameter extraction (@sec-methods) - identified 272 antibody-relevant eligibility clauses spanning 228 unique trials (43.0% of the cohort), with 261 trials (49.2%)\*matching broader antibody/serostatus criteria prior to or across trial-level rules and 116 trials (21.9% of all trials; 44.4% of antibody-matched trials)\*containing an explicit numeric titer or threshold pattern.
+
+Within the 272 filtered clauses, 161 clauses (59.2%) explicitly referenced an AAV serotype string and 127 clauses (46.7%) matched a numeric titer or dilution/concentration threshold.
+
+```{r}
+#| label: tbl-sponsor-indication-summary
+#| tbl-cap: "Regex-extracted anti-AAV antibody and numeric titer prevalence across lead sponsor classes and broad therapeutic indications (N = 530 trials)."
+
+# Combine sponsor and indication summaries into clean reporting tables
+knitr::kable(sponsor_ab_summary, digits = 1)
+knitr::kable(indication_ab_summary, digits = 1)
+```
+
+#### Variation by Therapeutic Indication and Lead Sponsor Type
+
+Prevalence of regex-extracted antibody criteria differed substantially across broad therapeutic indication groups (Fisher's exact test with 2,000 Monte Carlo replicates, $p = 0.0005$). Trials targeting systemic or intravascular/hepatic pathways had the highest rates of antibody eligibility language - led by **Hematology / Coagulation** (**83.9%**, $47/56$), **Neuromuscular / Motor** (**81.4%**, $57/70$), and **Metabolic / Hepatic** (**71.1%**, $32/45$) - compared to **CNS / Neurodegenerative** (**30.5%**, $18/59$) and **Ophthalmology** (**9.9%**, $11/111$) that had markedly lower rates. Among antibody-matched trials, explicit numeric titer patterns appeared in **54.5%** ($6/11$) of ophthalmology trials and **52.6%** ($30/57$) of neuromuscular trials, compared with **27.7%** ($13/47$) of hematology/coagulation trials.
+
+Lead sponsor classification was also significantly associated with antibody clause prevalence across the primary sponsor groups (`INDUSTRY`, `OTHER`, and `NIH`; Pearson's $\chi^2 = 11.154$, $df = 2$, $p = 0.0038$). **OTHER** (predominantly academic medical centers, universities, and research foundations) showed **61.4%** ($86/140$) with matched antibody clauses and **NIH** showed **60.0%** ($3/5$), compared to **45.0%** ($168/373$) for **INDUSTRY**, **37.5%** ($3/8$) for **NETWORK**, and **25.0%** ($1/4$) for **OTHER_GOV**. And among trials with matched antibody clauses, numeric titer patterns were present in **54.7%** ($47/86$) of **OTHER**-sponsored trials versus **39.3%** ($66/168$) of **INDUSTRY**-sponsored trials.
+
+```{r}
+#| label: fig-ab-prevalence-sponsor-indication
+#| fig-cap: "Proportion of interventional AAV trials with regex-matched antibody criteria by lead sponsor class (top) and broad clinical indication (bottom)."
+
+# Plot regex antibody clause prevalence across lead sponsors and therapeutic areas
+p_sponsor / p_indication
+```
+
+#### Enrollment Year, Trial Era, and Clinical Phase Trends
+
+Annual trial starts expanded sharply from 2022 onward—reaching **70** trials in 2023, **63** in 2024, **55** in 2025, and **53** in 2026 (with **7** currently listed with start dates in 2027), alongside a lower count in 2020 (**29** trials, **31.0%** with antibody criteria). Across broader enrollment eras, the proportion of trials with regex-matched antibody criteria remained relatively consistent: **49.2%** ($63/128$) **Pre-2018**, **46.2%** ($55/119$) in **2018–2021**, and **50.5%** ($143/283$) in **2022–Present**. Notably, **2022–Present** accounted for **71** of the **116** trials with numeric titer cutoffs.
+
+Across clinical phases, **PHASE1/PHASE2** ($n = 219$, **52.5%** with antibody criteria) and **PHASE1** ($n = 121$, **50.4%**) were the largest groups, while **EARLY_PHASE1** had **70.5%** ($31/44$) and **PHASE3** had **45.3%** ($24/53$).
+
+```{r}
+#| label: tbl-era-phase-summary
+#| tbl-cap: "Regex-extracted antibody and numeric titer counts by enrollment era and trial phase."
+
+knitr::kable(era_ab_summary, digits = 1)
+knitr::kable(phase_ab_summary, digits = 1)
+```
+
+#### Limitations and Future Work
+
+Because these findings come from a deterministic `tidyverse` regex baseline (@sec-methods), a number of caveats apply here. Exact token and pattern matching can miss titer cutoffs written in narrative prose or non-standard formats, serotype assignment can be incomplete when vector names appear outside the matched clause, broad indication grouping leaves **183** trials in `"Other / Multi-System"`, and small subgroup counts (such as `NIH`, $n = 5$, or `PHASE4`, $n = 1$) warrant caution in statistical comparisons. I plan to circle back in future work to benchmark a local, open-weight LLM via `Ollama` and `ellmer` against this regex baseline to evaluate semantic disambiguation of antibody relevance, rule direction/polarity, assay type, and normalized titer thresholds!
+
 \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
 
 ## Conclusion
 
 This the conclusion. The @sec-results can be invoked here.
+
+These baseline findings show that anti-AAV antibody eligibility criteria are widespread across interventional AAV gene therapy trials yet unevenly specified - varying strongly by therapeutic indication and sponsor type, and often lacking standardized numeric titer cutoffs even when antibodies are referenced. Systemically delivered indications carry the heaviest burden of antibody screening language, highlighting both biological differences in vector exposure and ongoing opportunities to standardize serostatus reporting across trials.
