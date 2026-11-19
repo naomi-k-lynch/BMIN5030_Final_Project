@@ -68,8 +68,6 @@ To build our study cohort, we first want to load the various tables from AACT: s
 We also will take the time to filter out NCT ID's that are ANCA-associated vasculitis studies! They are caught in our regex matching because they share the same AAV acronym, but don't apply here.
 
 ```{r}
-#| eval: false
-
 # regex matching AAV, rAAV, scAAV, serotypes (AAV9, AAVrh74), and adeno-associated
 aav_pattern <- "\\b(r|sc)?aav[0-9a-z]*\\b|adeno[- ]associated"
 
@@ -109,6 +107,14 @@ ncts_keywords <- keywords_df %>%
 ncts_summaries <- summaries_df %>%
   filter(grepl(aav_pattern, description, ignore.case = TRUE, perl = TRUE)) %>%
   pull(nct_id)
+
+all_aav_ncts <- unique(c(
+  ncts_studies, 
+  ncts_interventions, 
+  ncts_other_names, 
+  ncts_keywords, 
+  ncts_summaries
+))
 
 # --- STEP 3: Identifying ANCA-associated vasculitis to remove false positives (getting caught in AAV) ---
 vasculitis_ncts <- unique(c(
